@@ -10,3 +10,7 @@ logs/
 wandb/
 outputs/
 MUJOCO_LOG.TXT
+
+# Local SSH credentials. Never commit private or public key files.
+sshkey*
+*GitHub key*

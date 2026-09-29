@@ -1,0 +1,12 @@
+*.egg-info/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.idea/
+.vscode/
+logs/
+wandb/
+outputs/
+MUJOCO_LOG.TXT

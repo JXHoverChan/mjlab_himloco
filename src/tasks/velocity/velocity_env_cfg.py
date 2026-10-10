@@ -299,7 +299,7 @@ def make_velocity_env_cfg() -> ManagerBasedRlEnvCfg:
     ),
     "is_terminated": RewardTermCfg(func=mdp.is_terminated, weight=-200.0),
     "joint_acc_l2": RewardTermCfg(func=mdp.joint_acc_l2, weight=-2.5e-7),
-    "joint_pos_limits": RewardTermCfg(func=mdp.joint_pos_limits, weight=-10.0),
+    "joint_pos_limits": RewardTermCfg(func=mdp.joint_pos_limits, weight=-0.1),
     "action_rate_l2": RewardTermCfg(func=mdp.action_rate_l2, weight=-0.05),
     "foot_gait": RewardTermCfg(
       func=mdp.feet_gait,
@@ -380,7 +380,10 @@ def make_velocity_env_cfg() -> ManagerBasedRlEnvCfg:
         "command_name": "twist",
         "velocity_stages": [
           {"step": 0, "lin_vel_x": (-0.5, 1.0), "lin_vel_y": (-0.5, 0.5), "ang_vel_z": (-1.0, 1.0)},
-          {"step": 5000 * 24, "lin_vel_x": (-1.0, 2.0), "lin_vel_y": (-1.0, 1.0)},
+          {"step": 1250 * 24, "lin_vel_x": (-0.6, 1.2), "lin_vel_y": (-0.6, 0.6), "ang_vel_z": (-1.0, 1.0)},
+          {"step": 2500 * 24, "lin_vel_x": (-0.7, 1.4), "lin_vel_y": (-0.7, 0.7), "ang_vel_z": (-1.0, 1.0)},
+          {"step": 3750 * 24, "lin_vel_x": (-0.85, 1.8), "lin_vel_y": (-0.85, 0.85), "ang_vel_z": (-1.0, 1.0)},
+          {"step": 5000 * 24, "lin_vel_x": (-1.0, 2.0), "lin_vel_y": (-1.0, 1.0), "ang_vel_z": (-1.0, 1.0)},
         ],
       },
     ),
@@ -395,7 +398,7 @@ def make_velocity_env_cfg() -> ManagerBasedRlEnvCfg:
       terrain=TerrainEntityCfg(
         terrain_type="generator",
         terrain_generator=replace(ROUGH_TERRAINS_CFG),
-        max_init_terrain_level=5,
+        max_init_terrain_level=1,
       ),
       sensors=(terrain_scan,),
       num_envs=4096,

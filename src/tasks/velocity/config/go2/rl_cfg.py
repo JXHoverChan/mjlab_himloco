@@ -121,7 +121,7 @@ def unitree_go2_him_runner_cfg() -> RslRlOnPolicyRunnerCfg:
       desired_kl=0.01,
       max_grad_norm=1.0,
       encoder_max_grad_norm=10.0,
-      num_prototypes=32,
+      num_prototypes=16,
       temperature=3.0,
       sinkhorn_epsilon=0.05,
       sinkhorn_iterations=3,

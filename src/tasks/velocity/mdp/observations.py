@@ -8,6 +8,8 @@ from mjlab.entity import Entity
 from mjlab.managers.scene_entity_config import SceneEntityCfg
 from mjlab.sensor import ContactSensor
 
+from .command_utils import is_standing_command
+
 if TYPE_CHECKING:
   from mjlab.envs import ManagerBasedRlEnv
 
@@ -52,3 +54,14 @@ def phase(env: ManagerBasedRlEnv, period: float, command_name: str) -> torch.Ten
     stand_mask = torch.linalg.norm(env.command_manager.get_command(command_name), dim=1) < 0.1
     phase = torch.where(stand_mask.unsqueeze(1), torch.zeros_like(phase), phase)
     return phase
+
+
+def phase_for_commanded_motion(
+  env: ManagerBasedRlEnv, period: float, command_name: str
+) -> torch.Tensor:
+  """Keep phase for any nonzero motion command, including slow pure yaw."""
+  command = env.command_manager.get_command(command_name)
+  assert command is not None
+  angle = (env.episode_length_buf * env.step_dt) % period / period * (2 * torch.pi)
+  value = torch.stack((torch.sin(angle), torch.cos(angle)), dim=-1)
+  return torch.where(is_standing_command(command).unsqueeze(-1), 0.0, value)

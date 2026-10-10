@@ -11,6 +11,17 @@ wandb/
 outputs/
 MUJOCO_LOG.TXT
 
+# Local-only workflows, documentation, and experiment artifacts.
+/sim2sim/
+/docs/
+/artifacts/
+*.log
+*.pt
+*.pth
+*.onnx
+*.mjb
+nan_dump*.npz
+
 # Local SSH credentials. Never commit private or public key files.
 sshkey*
 *GitHub key*

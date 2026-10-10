@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from typing import TYPE_CHECKING
 
 import torch
@@ -8,10 +9,13 @@ from mjlab.entity import Entity
 from mjlab.managers.reward_manager import RewardTermCfg
 from mjlab.managers.scene_entity_config import SceneEntityCfg
 from mjlab.sensor import BuiltinSensor, ContactSensor
+from mjlab.sensor.terrain_height_sensor import TerrainHeightSensor
 from mjlab.utils.lab_api.math import quat_apply_inverse
 from mjlab.utils.lab_api.string import (
   resolve_matching_names_values,
 )
+
+from .command_utils import is_standing_command
 
 if TYPE_CHECKING:
   from mjlab.envs import ManagerBasedRlEnv
@@ -58,6 +62,105 @@ def track_angular_velocity(
   xy_error = torch.sum(torch.square(actual[:, :2]), dim=1)
   ang_vel_error = z_error + (0.05 * xy_error)
   return torch.exp(-ang_vel_error / std**2)
+
+
+def track_planar_velocity(
+  env: ManagerBasedRlEnv,
+  std: float,
+  command_name: str,
+  asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+  """Track body-frame XY commands independently of vertical motion."""
+  asset: Entity = env.scene[asset_cfg.name]
+  command = env.command_manager.get_command(command_name)
+  assert command is not None
+  error = torch.sum((command[:, :2] - asset.data.root_link_lin_vel_b[:, :2]) ** 2, dim=1)
+  return torch.exp(-error / std**2)
+
+
+def track_planar_velocity_anisotropic(
+  env: ManagerBasedRlEnv,
+  std_x: float,
+  std_y: float,
+  command_name: str,
+  asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+  """Track body-frame XY velocity with independent forward/lateral error scales.
+
+  These are exponential-kernel scales, not hard error limits. An error equal
+  to one axis's scale, with zero error on the other axis, yields exp(-1).
+  """
+  if not all(math.isfinite(std) and std > 0 for std in (std_x, std_y)):
+    raise ValueError("Velocity tracking scales must be finite and positive.")
+  asset: Entity = env.scene[asset_cfg.name]
+  command = env.command_manager.get_command(command_name)
+  assert command is not None
+  error = command[:, :2] - asset.data.root_link_lin_vel_b[:, :2]
+  scaled_error = (error[:, 0] / std_x).square() + (error[:, 1] / std_y).square()
+  return torch.exp(-scaled_error)
+
+
+def track_yaw_velocity(
+  env: ManagerBasedRlEnv,
+  std: float,
+  command_name: str,
+  asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+  """Track body-frame yaw commands independently of roll/pitch motion."""
+  asset: Entity = env.scene[asset_cfg.name]
+  command = env.command_manager.get_command(command_name)
+  assert command is not None
+  error = (command[:, 2] - asset.data.root_link_ang_vel_b[:, 2]) ** 2
+  return torch.exp(-error / std**2)
+
+
+def vertical_velocity_l2(
+  env: ManagerBasedRlEnv,
+  asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+  """Measure body-frame vertical motion as an independent regularizer."""
+  asset: Entity = env.scene[asset_cfg.name]
+  return asset.data.root_link_lin_vel_b[:, 2] ** 2
+
+
+def roll_pitch_velocity_l2(
+  env: ManagerBasedRlEnv,
+  asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+  """Measure body-frame roll/pitch motion without penalizing commanded yaw."""
+  asset: Entity = env.scene[asset_cfg.name]
+  return torch.sum(asset.data.root_link_ang_vel_b[:, :2] ** 2, dim=1)
+
+
+def terrain_progress(
+  env: ManagerBasedRlEnv,
+  command_name: str,
+  command_threshold: float = 0.1,
+  asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+  """Reward positive planar progress along the commanded direction.
+
+  Commands and root-link linear velocity are both expressed in the body
+  frame. The reward is the positive projection of the actual velocity onto
+  the planar command direction, capped by the commanded speed. Since the
+  reward manager scales reward rates by ``dt``, the episode sum represents
+  command-aligned displacement rather than endpoint distance.
+  """
+  asset: Entity = env.scene[asset_cfg.name]
+  command = env.command_manager.get_command(command_name)
+  assert command is not None, f"Command '{command_name}' not found."
+
+  command_xy = command[:, :2]
+  command_speed = torch.norm(command_xy, dim=1)
+  actual_velocity_xy = asset.data.root_link_lin_vel_b[:, :2]
+  projected_speed = torch.sum(actual_velocity_xy * command_xy, dim=1) / command_speed.clamp_min(
+    1e-6
+  )
+
+  progress = torch.clamp(projected_speed, min=0.0)
+  progress = torch.minimum(progress, command_speed)
+  active = command_speed > command_threshold
+  return torch.where(active, progress, torch.zeros_like(progress))
 
 
 def body_orientation_l2(
@@ -174,6 +277,45 @@ def feet_clearance(
   vel_norm = torch.norm(foot_vel_xy, dim=-1)  # [B, N]
   delta = torch.abs(foot_z - target_height)  # [B, N]
   cost = torch.sum(delta * vel_norm, dim=1)  # [B]
+  if command_name is not None:
+    command = env.command_manager.get_command(command_name)
+    if command is not None:
+      linear_norm = torch.norm(command[:, :2], dim=1)
+      angular_norm = torch.abs(command[:, 2])
+      total_command = linear_norm + angular_norm
+      active = (total_command > command_threshold).float()
+      cost = cost * active
+  return cost
+
+
+def feet_terrain_clearance(
+  env: ManagerBasedRlEnv,
+  target_height: float,
+  height_sensor_name: str,
+  command_name: str | None = None,
+  command_threshold: float = 0.1,
+  asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+  """Penalize deviation from foot-to-terrain clearance while the feet move.
+
+  Unlike :func:`feet_clearance`, this term uses a terrain-height sensor, so
+  ``target_height`` is measured relative to the local terrain under each foot
+  instead of the world frame.
+  """
+  asset: Entity = env.scene[asset_cfg.name]
+  height_sensor = env.scene[height_sensor_name]
+  if not isinstance(height_sensor, TerrainHeightSensor):
+    raise TypeError(
+      "feet_terrain_clearance requires a TerrainHeightSensor, "
+      f"got {type(height_sensor).__name__}"
+    )
+
+  foot_clearance = height_sensor.data.heights  # [B, N]
+  foot_vel_xy = asset.data.site_lin_vel_w[:, asset_cfg.site_ids, :2]  # [B, N, 2]
+  vel_norm = torch.norm(foot_vel_xy, dim=-1)  # [B, N]
+  delta = torch.abs(foot_clearance - target_height)  # [B, N]
+  cost = torch.sum(delta * vel_norm, dim=1)  # [B]
+
   if command_name is not None:
     command = env.command_manager.get_command(command_name)
     if command is not None:
@@ -403,6 +545,66 @@ class variable_posture:
     error_squared = torch.square(current_joint_pos - desired_joint_pos)
 
     return torch.exp(-torch.mean(error_squared / (std**2), dim=1))
+
+
+class standing_posture(variable_posture):
+  """Reward the default joint posture only when commanded to stand still."""
+
+  def __call__(
+    self,
+    env: ManagerBasedRlEnv,
+    std_standing,
+    std_walking,
+    std_running,
+    asset_cfg: SceneEntityCfg,
+    command_name: str,
+    walking_threshold: float = 0.1,
+    running_threshold: float = 1.5,
+  ) -> torch.Tensor:
+    posture = super().__call__(
+      env, std_standing, std_walking, std_running, asset_cfg,
+      command_name, walking_threshold, running_threshold,
+    )
+    command = env.command_manager.get_command(command_name)
+    assert command is not None
+    at_rest = torch.norm(command[:, :2], dim=1) + torch.abs(command[:, 2]) < walking_threshold
+    return posture * at_rest.float()
+
+
+class commanded_standing_posture(variable_posture):
+  """Reward the default pose only for an explicit all-zero standing command."""
+
+  def __call__(
+    self,
+    env: ManagerBasedRlEnv,
+    std_standing,
+    std_walking,
+    std_running,
+    asset_cfg: SceneEntityCfg,
+    command_name: str,
+    walking_threshold: float = 0.1,
+    running_threshold: float = 1.5,
+  ) -> torch.Tensor:
+    posture = super().__call__(
+      env, std_standing, std_walking, std_running, asset_cfg,
+      command_name, walking_threshold, running_threshold,
+    )
+    command = env.command_manager.get_command(command_name)
+    assert command is not None
+    return posture * is_standing_command(command).float()
+
+
+def stand_still_on_zero_command(
+  env: ManagerBasedRlEnv,
+  command_name: str,
+  asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+  """Penalize joint displacement at rest, never during commanded motion."""
+  asset: Entity = env.scene[asset_cfg.name]
+  command = env.command_manager.get_command(command_name)
+  assert command is not None
+  error = asset.data.joint_pos[:, asset_cfg.joint_ids] - asset.data.default_joint_pos[:, asset_cfg.joint_ids]
+  return torch.sum(error.square(), dim=1) * is_standing_command(command).float()
 
 
 def stand_still(

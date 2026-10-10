@@ -20,12 +20,21 @@ from mjlab.utils.os import dump_yaml, get_checkpoint_path, get_wandb_checkpoint_
 from mjlab.utils.torch import configure_torch_backends
 from mjlab.utils.wandb import add_wandb_tags
 from mjlab.utils.wrappers import VideoRecorder
+from src.tasks.velocity.mdp.reward_profiles import RewardProfile, apply_him_reward_profile
 
 
 @dataclass(frozen=True)
 class TrainConfig:
   env: ManagerBasedRlEnvCfg
   agent: RslRlBaseRunnerCfg
+  action_rate_weight: float | None = None
+  """Optional override for the velocity task's action-rate reward weight."""
+  reward_profile: RewardProfile | None = None
+  """HIM reward variant; task default is baseline_v2. Legacy restores old rewards."""
+  checkpoint_file: str | None = None
+  """Explicit local checkpoint to continue training, independent of the new log root."""
+  freeze_curriculum: bool = False
+  """Disable curriculum updates for controlled short training comparisons."""
   registry_name: str | None = None
   video: bool = False
   video_length: int = 200
@@ -65,6 +74,23 @@ def run_train(task_id: str, cfg: TrainConfig, log_dir: Path) -> None:
 
   cfg.agent.seed = seed
   cfg.env.seed = seed
+
+  if cfg.reward_profile is not None:
+    apply_him_reward_profile(cfg.env, cfg.reward_profile)
+    print(f"[INFO] HIM reward profile: {cfg.reward_profile}")
+  if cfg.freeze_curriculum:
+    cfg.env.curriculum = {}
+    print("[INFO] Curriculum updates disabled for this run")
+
+  if cfg.action_rate_weight is not None:
+    action_rate_term = cfg.env.rewards.get("action_rate_l2")
+    if action_rate_term is None:
+      raise KeyError("Cannot override action_rate_weight: reward term is missing")
+    action_rate_term.weight = cfg.action_rate_weight
+    print(
+      "[INFO] Overriding rewards/action_rate_l2 weight: "
+      f"{cfg.action_rate_weight}"
+    )
 
   print(f"[INFO] Training with: device={device}, seed={seed}, rank={rank}")
 
@@ -114,7 +140,13 @@ def run_train(task_id: str, cfg: TrainConfig, log_dir: Path) -> None:
   log_root_path = log_dir.parent  # Go up from specific run dir to experiment dir.
 
   resume_path: Path | None = None
-  if cfg.agent.resume:
+  if cfg.checkpoint_file is not None:
+    if cfg.wandb_run_path is not None:
+      raise ValueError("Choose checkpoint_file or wandb_run_path, not both.")
+    resume_path = Path(cfg.checkpoint_file).expanduser().resolve()
+    if not resume_path.is_file():
+      raise FileNotFoundError(f"Checkpoint file not found: {resume_path}")
+  elif cfg.agent.resume:
     if cfg.wandb_run_path is not None:
       # Load checkpoint from W&B.
       resume_path, was_cached = get_wandb_checkpoint_path(

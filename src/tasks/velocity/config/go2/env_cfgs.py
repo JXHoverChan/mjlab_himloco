@@ -10,15 +10,27 @@ from mjlab.envs import ManagerBasedRlEnvCfg
 from mjlab.envs import mdp as envs_mdp
 from mjlab.envs.mdp.actions import JointPositionActionCfg
 from mjlab.managers import TerminationTermCfg
+from mjlab.managers.curriculum_manager import CurriculumTermCfg
 from mjlab.managers.event_manager import EventTermCfg
-from mjlab.sensor import ContactMatch, ContactSensorCfg, RayCastSensorCfg
+from mjlab.managers.reward_manager import RewardTermCfg
+from mjlab.managers.scene_entity_config import SceneEntityCfg
+from mjlab.sensor import (
+  ContactMatch,
+  ContactSensorCfg,
+  ObjRef,
+  RayCastSensorCfg,
+  RingPatternCfg,
+  TerrainHeightSensorCfg,
+)
 from mjlab.tasks.velocity import mdp
 from mjlab.tasks.velocity.mdp import UniformVelocityCommandCfg
 from mjlab.managers.observation_manager import ObservationTermCfg, ObservationGroupCfg
 from mjlab.utils.noise import UniformNoiseCfg as Unoise
-from mjlab.sensor import RayCastSensorCfg
 
 from src.tasks.velocity.velocity_env_cfg import make_velocity_env_cfg
+from src.tasks.velocity import mdp as local_mdp
+from src.tasks.velocity.mdp.reward_profiles import apply_him_reward_profile
+from src.tasks.velocity.mdp.stratified_velocity_command import StratifiedVelocityCommandCfg
 
 TerrainType = Literal["rough", "obstacles"]
 
@@ -29,8 +41,8 @@ def unitree_go2_rough_env_cfg(
   """Create Unitree Go2 rough terrain velocity configuration."""
   cfg = make_velocity_env_cfg()
 
-  cfg.sim.mujoco.ccd_iterations = 500
-  cfg.sim.contact_sensor_maxmatch = 500
+  cfg.sim.mujoco.ccd_iterations = 200
+  cfg.sim.contact_sensor_maxmatch = 256
   cfg.sim.nconmax = None
 
   cfg.scene.entities = {"robot": get_go2_robot_cfg()}
@@ -70,11 +82,29 @@ def unitree_go2_rough_env_cfg(
     num_slots=1,
     history_length=4,
   )
+
+  thigh_geom_names = tuple(
+    f"{leg}_thigh_collision" for leg in foot_names
+  )
+  thigh_ground_cfg = ContactSensorCfg(
+    name="thigh_ground_touch",
+    primary=ContactMatch(
+      mode="geom",
+      entity="robot",
+      pattern=thigh_geom_names,
+    ),
+    secondary=ContactMatch(mode="body", pattern="terrain"),
+    fields=("found", "force"),
+    reduce="none",
+    num_slots=1,
+    history_length=4,
+  )
+
   cfg.scene.sensors = (cfg.scene.sensors or ()) + (
     feet_ground_cfg,
     nonfoot_ground_cfg,
+    thigh_ground_cfg,
   )
-
 
   if cfg.scene.terrain is not None and cfg.scene.terrain.terrain_generator is not None:
     cfg.scene.terrain.terrain_generator.curriculum = True
@@ -107,13 +137,22 @@ def unitree_go2_rough_env_cfg(
     r".*(FR|FL|RR|RL)_calf_joint.*": 0.5,
   }
 
-  cfg.rewards["foot_gait"].params["offset"] = [0.0, 0.5, 0.5, 0.0]
   cfg.rewards["body_orientation_l2"].params["asset_cfg"].body_names = ("base_link",)
   cfg.rewards["body_ang_vel"].params["asset_cfg"].body_names = ("base_link",)
   cfg.rewards["foot_clearance"].params["asset_cfg"].site_names = site_names
   cfg.rewards["foot_slip"].params["asset_cfg"].site_names = site_names
 
-  cfg.terminations["illegal_contact"] = TerminationTermCfg(
+  # cfg.rewards["foot_gait"].params["offset"] = [0.0, 0.5, 0.5, 0.0]
+  cfg.rewards.pop("foot_gait", None)
+
+  cfg.terminations.pop("fell_over", None)
+
+  cfg.terminations["illegal_contact_1"] = TerminationTermCfg(
+    func=mdp.illegal_contact,
+    params={"sensor_name": thigh_ground_cfg.name},
+  )
+
+  cfg.terminations["nonfoot_ground_2"] = TerminationTermCfg(
     func=mdp.illegal_contact,
     params={"sensor_name": nonfoot_ground_cfg.name, "force_threshold": 10.0},
   )
@@ -179,9 +218,107 @@ def HIMloco_Go2_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
   """Create the Go2 velocity configuration used by the HIM policy."""
   cfg = unitree_go2_rough_env_cfg(play=play)
 
+  cfg.terminations["terrain_bounds"] = TerminationTermCfg(
+    func=local_mdp.out_of_terrain_bounds,
+    params={"margin": 0.3},
+    time_out=True,
+  )
+
+
+  if not play:
+    # Sampling runs at every command timer expiry, not just episode reset.
+    cfg.commands["twist"] = StratifiedVelocityCommandCfg(**vars(cfg.commands["twist"]))
+    cfg.curriculum["terrain_levels"] = CurriculumTermCfg(
+      func=local_mdp.AdaptiveTerrainCurriculum,
+      params={
+        "command_name": "twist",
+        "command_activity_threshold": 0.1,
+        "terrain_down_distance_ratio": 0.5,
+        "linear_error_up_threshold": 0.75,
+        "linear_error_down_threshold": 1.10,
+        "yaw_error_up_threshold": 0.20,
+        "yaw_error_down_threshold": 0.35,
+      },
+    )
+    cfg.curriculum["command_vel"] = CurriculumTermCfg(
+      func=local_mdp.StratifiedVelocityCurriculum,
+      params={
+        "command_name": "twist",
+        "mode_probabilities": {
+          "standing": 0.05,
+          "low_forward": 0.15,
+          "low_backward": 0.15,
+          "lateral": 0.10,
+          "pure_yaw": 0.20,
+          "translation": 0.10,
+          "combined": 0.25,
+        },
+        "linear_speed_band": (0.2, 0.8),
+        "yaw_speed_band": (0.05, 1.0),
+        "initial_ranges": {
+          "lin_vel_x": (-0.5, 1.0),
+          "lin_vel_y": (-0.5, 0.5),
+          "ang_vel_z": (-0.5, 0.5),
+        },
+        "maximum_ranges": {
+          "lin_vel_x": (-1.5, 2.5),
+          "lin_vel_y": (-1.5, 1.5),
+          "ang_vel_z": (-1.5, 1.5),
+        },
+        "error_up_threshold": 0.75,
+        "error_down_threshold": 1.0,
+        "level_step": 0.025,
+        "update_every_episodes": 4096,
+      },
+    )
+
+  cfg.scene.terrain.max_init_terrain_level = 10
+
+  # Measure foot clearance relative to the local terrain, not world z.
+  site_names = ("FR", "FL", "RR", "RL")
+  foot_height_scan = TerrainHeightSensorCfg(
+    name="foot_height_scan",
+    frame=tuple(
+      ObjRef(type="site", name=site_name, entity="robot")
+      for site_name in site_names
+    ),
+    ray_alignment="yaw",
+    pattern=RingPatternCfg.single_ring(radius=0.04, num_samples=4),
+    max_distance=1.0,
+    exclude_parent_body=True,
+    include_geom_groups=(0,),
+  )
+  cfg.scene.sensors = (cfg.scene.sensors or ()) + (foot_height_scan,)
+  cfg.rewards.pop("foot_clearance", None)
+  cfg.rewards["terrain_progress"] = RewardTermCfg(
+    func=local_mdp.terrain_progress,
+    weight=0.1,
+    params={
+      "command_name": "twist",
+      "command_threshold": 0.1,
+    },
+  )
+  # cfg.rewards["foot_terrain_clearance"] = RewardTermCfg(
+  #   func=local_mdp.feet_terrain_clearance,
+  #   weight=-1.0,
+  #   params={
+  #     "target_height": 0.15,
+  #     "height_sensor_name": foot_height_scan.name,
+  #     "command_name": "twist",
+  #     "command_threshold": 0.1,
+  #     "asset_cfg": SceneEntityCfg("robot", site_names=site_names),
+  #   },
+  # )
+
+  # Allow incidental calf/hip/body terrain contacts in HIM locomotion.
+  # Keep illegal_contact_1, which monitors thigh contact, as the contact termination.
+  cfg.terminations.pop("nonfoot_ground_2", None)
+
   # HIM receives proprioception history; terrain height remains privileged to the critic.
+  for group in ("actor", "critic"):
+    cfg.observations[group].terms["phase"].func = local_mdp.phase_for_commanded_motion
   cfg.observations["actor"].terms.pop("height_scan")
-  cfg.observations["actor"].history_length = 6
+  cfg.observations["actor"].history_length = 5
   cfg.observations["actor"].flatten_history_dim = False
 
   # Target is the same one-step observation space, evaluated after env.step().
@@ -208,6 +345,9 @@ def HIMloco_Go2_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
     enable_corruption=False,
     history_length=0,
   )
+
+  # Separate tracking objectives from stability constraints; reserve pose for rest.
+  apply_him_reward_profile(cfg, "baseline_v2")
 
   # Apply play mode overrides.
   if play:

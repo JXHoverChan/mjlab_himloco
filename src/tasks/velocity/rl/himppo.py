@@ -230,12 +230,15 @@ class HIM_PPO(PPO):
       assignments /= batch_size
     return (assignments * batch_size).T
 
-  def _update_encoders(self, batch: RolloutStorage.Batch) -> tuple[float, float]:
+  def _update_encoders(
+    self, batch: RolloutStorage.Batch
+  ) -> tuple[torch.Tensor, torch.Tensor]:
     """Run one aligned source/target encoder update."""
     done = batch.dones.to(torch.bool).squeeze(-1)  # type: ignore[union-attr]
     valid = ~done
     if not torch.any(valid):
-      return 0.0, 0.0
+      zero = self.prototypes.new_zeros(())
+      return zero, zero
 
     source_observations = batch.observations[self.source_obs_group][valid]  # type: ignore[index]
     target_observations = batch.next_target_observations[valid]
@@ -268,16 +271,20 @@ class HIM_PPO(PPO):
     nn.utils.clip_grad_norm_(self._encoder_parameters, self.encoder_max_grad_norm)
     self.encoder_optimizer.step()
 
-    return estimation_loss.item(), swap_loss.item()
+    # Keep scalar logging values on the training device. Calling ``item()`` here
+    # would synchronize the host once for every auxiliary mini-batch.
+    return estimation_loss.detach(), swap_loss.detach()
 
   def update(self) -> dict[str, float]:
     """Run PPO and HIM updates over the collected rollout."""
-    mean_value_loss = 0.0
-    mean_surrogate_loss = 0.0
-    mean_entropy = 0.0
-    mean_estimation_loss = 0.0
-    mean_swap_loss = 0.0
-    mean_rnd_loss = 0.0 if self.rnd else None
+    mean_value_loss = torch.zeros((), device=self.device)
+    mean_surrogate_loss = torch.zeros((), device=self.device)
+    mean_entropy = torch.zeros((), device=self.device)
+    mean_estimation_loss = torch.zeros((), device=self.device)
+    mean_swap_loss = torch.zeros((), device=self.device)
+    mean_rnd_loss: torch.Tensor | None = (
+      torch.zeros((), device=self.device) if self.rnd else None
+    )
 
     generator = self.storage.mini_batch_generator(self.num_mini_batches, self.num_learning_epochs)
     for batch in generator:
@@ -353,25 +360,31 @@ class HIM_PPO(PPO):
       if self.rnd:
         self.rnd.optimizer.step()
 
-      mean_value_loss += value_loss.item()
-      mean_surrogate_loss += surrogate_loss.item()
-      mean_entropy += entropy.mean().item()
-      mean_estimation_loss += estimation_loss
-      mean_swap_loss += swap_loss
+      # Accumulate detached scalars on the GPU. Convert the final averages to
+      # Python floats only once after all mini-batches have finished.
+      mean_value_loss = mean_value_loss + value_loss.detach()
+      mean_surrogate_loss = mean_surrogate_loss + surrogate_loss.detach()
+      mean_entropy = mean_entropy + entropy.mean().detach()
+      mean_estimation_loss = mean_estimation_loss + estimation_loss
+      mean_swap_loss = mean_swap_loss + swap_loss
       if mean_rnd_loss is not None:
         assert rnd_loss is not None
-        mean_rnd_loss += rnd_loss.item()
+        mean_rnd_loss = mean_rnd_loss + rnd_loss.detach()
 
     num_updates = self.num_learning_epochs * self.num_mini_batches
-    loss_dict: dict[str, float] = {
-      "value": mean_value_loss / num_updates,
-      "surrogate": mean_surrogate_loss / num_updates,
-      "entropy": mean_entropy / num_updates,
-      "estimation": mean_estimation_loss / num_updates,
-      "swap": mean_swap_loss / num_updates,
-    }
+    loss_names = ["value", "surrogate", "entropy", "estimation", "swap"]
+    loss_totals = [
+      mean_value_loss,
+      mean_surrogate_loss,
+      mean_entropy,
+      mean_estimation_loss,
+      mean_swap_loss,
+    ]
     if mean_rnd_loss is not None:
-      loss_dict["rnd"] = mean_rnd_loss / num_updates
+      loss_names.append("rnd")
+      loss_totals.append(mean_rnd_loss)
+    loss_values = torch.stack(loss_totals).div(num_updates).cpu().tolist()
+    loss_dict = dict(zip(loss_names, loss_values, strict=True))
 
     self.storage.clear()
     return loss_dict
